@@ -1,0 +1,117 @@
+name: SEO audit
+
+# Adds a "Run workflow" button: repo -> Actions -> SEO audit -> Run workflow.
+# Type a URL, press Run, download the PDF from the Artifacts section of the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website to audit, e.g. https://client-site.in"
+        required: true
+        type: string
+      pages:
+        description: "Pages to crawl (1-12)"
+        required: false
+        default: "8"
+        type: string
+      depth:
+        description: "Link depth from the home page (0-3)"
+        required: false
+        default: "2"
+        type: string
+      client:
+        description: "Client name printed on the cover (optional)"
+        required: false
+        default: ""
+        type: string
+      label:
+        description: "Public URL caption when auditing a staging copy (optional)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Crawl and score
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        run: |
+          if [ -d tests ]; then
+            python -m unittest discover -s tests -v
+          else
+            echo "No tests directory in this repo — skipping."
+          fi
+
+      - name: Audit
+        id: audit
+        env:
+          TARGET: ${{ inputs.url }}
+          PAGES: ${{ inputs.pages }}
+          DEPTH: ${{ inputs.depth }}
+          CLIENT: ${{ inputs.client }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -o pipefail
+          python kovik_audit.py "$TARGET" \
+            --pages "$PAGES" \
+            --depth "$DEPTH" \
+            --delay 0.4 \
+            --client "$CLIENT" \
+            --label "$LABEL" \
+            --out report.pdf \
+            --json report.json \
+            --csv issues.csv 2>&1 | tee audit-log.txt
+
+      - name: Write the result into the run summary
+        if: always()
+        run: |
+          echo "## Audit of ${{ inputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -40 audit-log.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no log" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain a refusal
+        if: failure()
+        run: |
+          echo "### No report was written" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The engine refuses to score a site it could not measure. The usual causes:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- the site returned 403 to a non-browser visitor (bot protection)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- the page did not respond at all" >> "$GITHUB_STEP_SUMMARY"
+          echo "- the content is built in the browser, so the HTML is an empty shell" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "A made-up score would have been the wrong answer. See the log above for the exact reason." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-audit-${{ github.run_number }}
+          path: |
+            report.pdf
+            report.json
+            issues.csv
+            audit-log.txt
+          if-no-files-found: warn
+          retention-days: 30
+          
