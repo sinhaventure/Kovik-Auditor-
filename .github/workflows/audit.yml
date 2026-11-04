@@ -48,10 +48,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt in the repo — installing the engine's packages directly."
+            pip install "requests>=2.28" "beautifulsoup4>=4.11" "lxml>=4.9" "reportlab>=3.6" "matplotlib>=3.6"
+          fi
 
       - name: Run the test suite
         run: |
@@ -86,12 +91,16 @@ jobs:
         run: |
           echo "## Audit of ${{ inputs.url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -40 audit-log.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no log" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f audit-log.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -40 audit-log.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The audit step never ran — the job failed before it. Check the steps above." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Explain a refusal
-        if: failure()
+        if: steps.audit.outcome == 'failure'
         run: |
           echo "### No report was written" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
