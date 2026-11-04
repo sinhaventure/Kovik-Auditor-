@@ -1,0 +1,1527 @@
+From 6e9abddf2efd7557cb650c5712a1eaf700e38c5c Mon Sep 17 00:00:00 2001
+From: "R.R. Sinha" <rrsinha378@gmail.com>
+Date: Wed, 4 Nov 2026 17:54:42 +0000
+Subject: [PATCH] Stop scoring sites that were never fetched; stop leaking URLs
+
+The engine could report a confident score for a site it never loaded.
+
+Root cause: every check asked "which pages have this problem?" and scored a
+pass when the answer was an empty list. An empty list also means "no pages
+were checked", so a crawl that fetched nothing returned On-page 100,
+Content 100 and 81/100 overall, with the detail line "Every page has a
+title of a sensible length."
+
+What changed:
+
+- Analyzer.run() raises AuditError when no page was fetched, and again when
+  every page is rendered in the browser. main() exits 2 and writes no PDF.
+- New "skip" status for checks with nothing to inspect. Skipped checks are
+  removed from both numerator and denominator, categories with no measured
+  check are dropped and the remaining weights renormalised. Coverage is
+  computed and the run refuses to publish a score below 50%.
+- --label no longer rewrites the host of every finding. A staging crawl was
+  reporting "8 of 8 pages served over plain HTTP" about the live domain.
+  The label is a caption; measured URLs print as fetched, with a note
+  saying which address was measured.
+- HTTPS is "not measured" on a local or private origin instead of failed.
+- JS-rendered pages are detected and excluded from on-page checks, with a
+  new check that reports them. Previously an SPA scored as an empty page.
+- Failed pages stay in the page-by-page table with their status and no
+  score; they used to vanish, so the report claimed more pages than it
+  showed and every hidden page looked clean.
+- Redaction: URL credentials, and query values for tokens, keys, signatures,
+  sessions, OTPs and passwords, are stripped at one choke point before
+  anything is printed, exported or rendered. Response headers drop
+  Set-Cookie / Cookie / Authorization. JSON exports carry no page bodies,
+  headers, cookies or raw JSON-LD.
+- Politeness delay now applies after failed requests too; 404 probe URL is
+  stable across runs; nested-quote f-string that required Python 3.12 is
+  gone, so the stated 3.9+ floor is true again.
+- 17 regression tests covering the guarantees above.
+---
+ .gitignore              |   3 +
+ README.md               |  91 +++++-
+ kovik_audit.py          | 663 +++++++++++++++++++++++++++++++---------
+ tests/test_integrity.py | 178 +++++++++++
+ 4 files changed, 778 insertions(+), 157 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 tests/test_integrity.py
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..7d3716d
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++__pycache__/
++*.pyc
++audit-*.pdf
+diff --git a/README.md b/README.md
+index 29c6bb9..25ef447 100644
+--- a/README.md
++++ b/README.md
+@@ -1,11 +1,15 @@
+ # Kovik SEO Audit Engine
+ 
+-A real crawler in one Python file. It fetches the pages, parses the HTML, runs 26 checks,
++A real crawler in one Python file. It fetches the pages, parses the HTML, runs 27 checks,
+ scores five categories, and writes a branded PDF report — Kovik watermark on every page,
+ "Powered by Kovik Intelligence AI" in the footer.
+ 
+ No API keys, no third-party SEO service, no dashboard.
+ 
++**It refuses to score a site it could not fetch.** If no page loads, or the content is
++built entirely in the browser, the run stops with an explanation and writes nothing.
++A number that was never measured is worse than no number.
++
+ ---
+ 
+ ## Install
+@@ -34,7 +38,7 @@ Crawls up to 10 pages, prints the score in the terminal, writes `client-audit.pd
+ | `--json data.json` | Also dump every measurement as JSON |
+ | `--csv issues.csv` | Also dump the issue list as CSV |
+ | `--client "Sharma Dental"` | Client name printed on the cover |
+-| `--label https://client-site.in` | Public URL to show when auditing a staging copy |
++| `--label https://client-site.in` | Caption for a staging audit — see below |
+ | `--delay 0.5` | Seconds between requests — be polite on small servers |
+ | `--quiet` | No crawl progress in the terminal |
+ 
+@@ -46,9 +50,30 @@ python kovik_audit.py https://sharmadental.in \
+   --out sharma-dental-audit.pdf --csv sharma-dental-issues.csv
+ ```
+ 
++### Auditing a staging copy
++
++```bash
++python kovik_audit.py http://127.0.0.1:8801 --label https://sharmadental.in
++```
++
++`--label` is a **caption only**. The report cover carries the public name, and a note says
++plainly which address was measured. Every URL inside the report is printed exactly as it was
++fetched, because the alternative was a report that told a client their live HTTPS site was
++"served over plain HTTP" when all that had been tested was a local mirror.
++
++Checks that cannot be judged from a mirror — HTTPS in particular — are reported as
++**not measured** rather than failed.
++
++### Exit codes
++
++| Code | Meaning |
++|---|---|
++| `0` | Report written |
++| `2` | Refused: nothing fetched, content is client-side only, or too little of the checklist could be measured. No PDF, no score. |
++
+ ---
+ 
+-## What it checks (26 checks, five categories)
++## What it checks (27 checks, five categories)
+ 
+ **Technical — 30% of the score**
+ HTTPS, robots.txt reachable, XML sitemap present, real 404 handling, broken pages,
+@@ -59,7 +84,8 @@ Title tags present and well sized, duplicate titles, meta descriptions, duplicat
+ descriptions, single H1, H2 structure, image alt coverage.
+ 
+ **Content — 20%**
+-Word count per page (thin content), internal links per page.
++Word count per page (thin content), internal links per page, content visible without
++JavaScript.
+ 
+ **Structured data — 15%**
+ JSON-LD present and valid, schema types found, Open Graph tags, LocalBusiness /
+@@ -71,6 +97,23 @@ Server response time, HTML weight, gzip or brotli compression, cache headers.
+ Each check is weighted inside its category: pass = 1, improve = 0.5, fail = 0.
+ Categories are then weighted into the overall score out of 100.
+ 
++### How "not measured" works
++
++A check with nothing to inspect — no pages, no images, a JS-only page — is recorded as
++**not measured** and removed from *both* sides of the average. It does not score 1. It
++does not score 0. It is not part of the number.
++
++This matters: the first version counted an empty list of problems as a pass, so a crawl
++that fetched nothing at all scored 81/100 with "Good, with gaps" and "every page has a
++title". Now:
++
++* no page fetched → `AuditError`, exit 2, nothing written;
++* every page JS-rendered → `AuditError`, exit 2, nothing written;
++* some checks unmeasurable → they are excluded, and the report prints the coverage
++  ("25 of 27 checks could be measured") next to the score.
++
++If coverage falls below half of the checklist weight, the run refuses to publish a number.
++
+ ---
+ 
+ ## The report
+@@ -80,14 +123,45 @@ Categories are then weighted into the overall score out of 100.
+ * **Findings in detail** — grouped critical → low. Each finding shows what was measured,
+   which pages were affected, and what to do.
+ * **Page-by-page table** — status, page score, title and description length, H1 count,
+-  words, missing alt text, response time, page weight.
+-* **Method and limits** — what this audit does not cover, so nobody over-claims.
++  words, missing alt text, response time, page weight. Pages that failed or need
++  JavaScript stay in the table with no score, instead of disappearing.
++* **Method and limits** — what this audit does not cover, the pages that did not load,
++  and how the score is built.
+ 
+ Every page carries a diagonal **KOVIK DIGITAL SOLUTIONS** watermark and a footer with
+ **Powered by Kovik Intelligence AI · kovik.online**.
+ 
+ ---
+ 
++## Privacy and secrets
++
++Audit reports get forwarded, so nothing sensitive is allowed into one.
++
++* URL credentials (`user:pass@`) are stripped.
++* Query values for tokens, keys, signatures, sessions, OTPs and passwords are replaced
++  with `[redacted]` before anything is printed, stored or rendered.
++* Response headers are stored without `Set-Cookie`, `Cookie`, `Authorization` or
++  `WWW-Authenticate`.
++* The JSON export carries measurements only — never page bodies, headers, cookies or raw
++  JSON-LD blocks, which can contain contact details and form payloads.
++
++Redaction happens in one place (`Analyzer.add`), so every finding, the PDF, the CSV and the
++JSON get the same treatment.
++
++---
++
++## Tests
++
++```bash
++python -m unittest discover -s tests -v
++```
++
++17 tests, no network. They pin the guarantees above: an empty crawl raises instead of
++scoring, a skipped check cannot raise an average, a failed page keeps its row, and
++credentials never survive into an affected-URL list.
++
++---
++
+ ## Honest limits
+ 
+ * One crawl, from one location, at one moment. Response times are a signal, not a
+@@ -95,7 +169,10 @@ Every page carries a diagonal **KOVIK DIGITAL SOLUTIONS** watermark and a footer
+ * No backlink data, no search volume, no rank tracking, no Core Web Vitals field data.
+   Those need Search Console, Analytics and a rank tracker.
+ * JavaScript-rendered content is not executed. If a site builds its content in the
+-  browser, the crawler sees an almost empty page — that is itself worth reporting.
++  browser, the crawler says so and stops rather than grading an empty shell. Render the
++  pages on the server, prerender them, or use a JavaScript-capable crawler for those sites.
++* The checks cover on-page and technical SEO. They do not judge whether the copy is any
++  good, and they do not replace looking at the site.
+ 
+ ---
+ 
+diff --git a/kovik_audit.py b/kovik_audit.py
+index 358a06a..7076f38 100644
+--- a/kovik_audit.py
++++ b/kovik_audit.py
+@@ -14,6 +14,8 @@ from __future__ import annotations
+ 
+ import argparse
+ import csv
++import hashlib
++import ipaddress
+ import json
+ import os
+ import sys
+@@ -100,6 +102,8 @@ class Page:
+     links: List[str] = field(default_factory=list)
+     error: str = ""
+     headers: Dict[str, str] = field(default_factory=dict)
++    script_count: int = 0
++    js_only: bool = False
+ 
+ 
+ def norm(url: str) -> str:
+@@ -117,6 +121,66 @@ def same_host(a: str, b: str) -> bool:
+     return ha.replace("www.", "") == hb.replace("www.", "")
+ 
+ 
++# Query parameters whose value must never be printed, stored or put in a report.
++SECRET_PARAMS = ("token", "access_token", "id_token", "refresh_token", "key", "apikey",
++                 "api_key", "secret", "client_secret", "password", "passwd", "pwd",
++                 "auth", "authorization", "session", "sessionid", "sid", "sig",
++                 "signature", "otp", "pin", "code", "hash", "email")
++SECRET_HINTS = ("token", "secret", "passw", "apikey", "api_key", "signature",
++                "session", "auth", "cookie", "private")
++
++
++def redact_url(url: str) -> str:
++    """Strip credentials and secret-looking query values out of a URL.
++
++    Everything the tool prints, exports or prints in a PDF goes through here, so a
++    login link, a signed download or a session token in a query string cannot leak
++    into a client report or a JSON dump.
++    """
++    try:
++        p = urlparse(str(url))
++    except ValueError:
++        return "[unparseable url]"
++    if not p.scheme or not p.netloc:
++        return str(url)
++    netloc = p.netloc
++    if "@" in netloc:
++        netloc = "***@" + netloc.split("@", 1)[1]
++    query = ""
++    if p.query:
++        kept = []
++        for part in p.query.split("&"):
++            if not part:
++                continue
++            k = part.split("=", 1)[0]
++            kl = k.lower()
++            if kl in SECRET_PARAMS or any(h in kl for h in SECRET_HINTS):
++                kept.append(f"{k}=[redacted]")
++            else:
++                kept.append(part)
++        if kept:
++            query = "?" + "&".join(kept)
++    return f"{p.scheme}://{netloc}{p.path or '/'}{query}"
++
++
++def is_private_origin(url: str) -> bool:
++    """True for localhost, a private IP or an internal hostname.
++
++    HTTPS, robots.txt and sitemap findings about a staging copy say nothing about
++    the public domain, so they are reported as not measured instead of failed.
++    """
++    host = (urlparse(str(url)).hostname or "").strip().lower()
++    if not host:
++        return False
++    if host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
++        return True
++    try:
++        ip = ipaddress.ip_address(host)
++    except ValueError:
++        return False
++    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
++
++
+ class Crawler:
+     def __init__(self, start_url: str, max_pages: int = 10, max_depth: int = 2,
+                  delay: float = 0.4, timeout: int = 20, verbose: bool = True):
+@@ -134,6 +198,8 @@ class Crawler:
+         self.pages: List[Page] = []
+         self.seen: set = set()
+         self.broken: List[dict] = []
++        self.failed: List[dict] = []
++        self.fetched_ok: int = 0
+ 
+     # ---------------------------------------------------------------- robots
+     def load_robots(self) -> None:
+@@ -172,7 +238,10 @@ class Crawler:
+             page.status = resp.status_code
+             page.bytes = len(resp.content)
+             page.content_type = resp.headers.get("Content-Type", "")
+-            page.headers = {k.lower(): v for k, v in resp.headers.items()}
++            # Cookies and auth headers are never stored: they end up in exports.
++            page.headers = {k.lower(): v for k, v in resp.headers.items()
++                            if k.lower() not in ("set-cookie", "cookie", "authorization",
++                                                 "proxy-authorization", "www-authenticate")}
+             page.redirect_chain = [h.url for h in resp.history] if resp.history else []
+             if resp.status_code >= 400:
+                 page.error = f"HTTP {resp.status_code}"
+@@ -188,6 +257,7 @@ class Crawler:
+     # ---------------------------------------------------------------- parse
+     def parse(self, page: Page, html: str) -> None:
+         soup = BeautifulSoup(html, "lxml")
++        page.script_count = len(soup.find_all("script"))
+ 
+         t = soup.find("title")
+         page.title = t.get_text(strip=True) if t else ""
+@@ -254,6 +324,13 @@ class Crawler:
+         text = soup.get_text(" ", strip=True)
+         page.words = len(text.split())
+ 
++        # A page with no readable text, scripts on it and a framework mount point is
++        # built in the browser. Marking it lets the checks say "cannot see this"
++        # instead of scoring an empty shell as a bad page.
++        html_l = html.lower()
++        marker = any(m in html_l for m in FRAMEWORK_MARKERS)
++        page.js_only = page.words < 40 and page.script_count > 0 and (marker or page.words < 12)
++
+     # ---------------------------------------------------------------- crawl
+     def run(self) -> List[Page]:
+         self.load_robots()
+@@ -263,22 +340,24 @@ class Crawler:
+             url, depth = queue.popleft()
+             if not self.allowed(url):
+                 if self.verbose:
+-                    print(f"  blocked by robots.txt: {url}")
++                    print(f"  blocked by robots.txt: {redact_url(url)}")
+                 continue
+             if self.verbose:
+-                print(f"  [{len(self.pages)+1}/{self.max_pages}] {url}")
++                print(f"  [{len(self.pages)+1}/{self.max_pages}] {redact_url(url)}")
+             page = self.fetch(url)
+             self.pages.append(page)
+             if page.status >= 400 or page.error:
++                self.failed.append({"url": url, "status": page.status, "error": page.error})
+                 self.broken.append({"url": url, "status": page.status, "error": page.error})
++                time.sleep(self.delay)
+                 continue
+-            if depth >= self.max_depth:
+-                continue
+-            for target in page.links:
+-                if target in self.seen:
+-                    continue
+-                self.seen.add(target)
+-                queue.append((target, depth + 1))
++            self.fetched_ok += 1
++            if depth < self.max_depth:
++                for target in page.links:
++                    if target in self.seen:
++                        continue
++                    self.seen.add(target)
++                    queue.append((target, depth + 1))
+             time.sleep(self.delay)
+         return self.pages
+ 
+@@ -305,7 +384,25 @@ WEIGHTS = {
+ }
+ 
+ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+-STATUS_VALUE = {"pass": 1.0, "warn": 0.5, "fail": 0.0, "info": 1.0}
++
++# A check that could not be measured contributes NOTHING to the score. It used to
++# contribute a full pass, because an empty list of "pages with a problem" is also an
++# empty list of "pages checked". That is how a site that never loaded scored 81.
++STATUS_VALUE = {"pass": 1.0, "warn": 0.5, "fail": 0.0}
++UNMEASURED = ("skip", "info")
++
++# Below this share of the check weight we refuse to publish a number at all.
++MIN_COVERAGE = 0.50
++
++# Pages this thin, with scripts on them and a framework mount point, are almost
++# certainly built in the browser. We cannot see their content, so we say so
++# instead of scoring them as if they were empty pages.
++FRAMEWORK_MARKERS = ("__next_data__", "ng-version", "data-reactroot", 'id="root"',
++                     'id="app"', 'id="__nuxt"', 'id="svelte"', "svelte-", "data-v-app")
++
++
++class AuditError(RuntimeError):
++    """Raised when an audit cannot honestly be scored."""
+ 
+ 
+ @dataclass
+@@ -322,36 +419,77 @@ class Check:
+ 
+ 
+ def short(url: str, n: int = 48) -> str:
++    url = redact_url(url)
+     p = urlparse(url)
+     path = p.path or "/"
+     s = p.netloc + path
+-    return s if len(s) <= n else s[: n - 1] + "…"
++    return s if len(s) <= n else s[: n - 1] + "\u2026"
++
++
++def _content_check(id, category, title, severity, fix, weight):
++    """Mark an on-page check 'not measured' when no page returned readable HTML.
++
++    Without this, a site whose content is rendered in the browser produced an
++    empty page list for every on-page check, and every one of them scored a pass.
++    """
++    def deco(fn):
++        def wrapper(self):
++            if not self.content_pages:
++                return self._skip(
++                    id, category, title, severity, fix,
++                    "Not measured \u2014 no page returned readable HTML, so this check had "
++                    "nothing to inspect. See 'Content visible without JavaScript'.",
++                    weight)
++            return fn(self)
++        wrapper.__name__ = fn.__name__
++        return wrapper
++    return deco
+ 
+ 
+ class Analyzer:
+     def __init__(self, crawler, timeout: int = 15):
+         self.c = crawler
+-        self.pages: List[Page] = [p for p in crawler.pages]
++        self.pages: List[Page] = list(crawler.pages)
+         self.ok_pages: List[Page] = [p for p in self.pages if p.status < 400 and not p.error]
++        # Pages whose HTML actually carries the content. JS-built pages are excluded:
++        # their empty body is a rendering limit of the crawler, not a content problem.
++        self.content_pages: List[Page] = [p for p in self.ok_pages if not p.js_only]
+         self.base = crawler.start
+         self.timeout = timeout
+         self.checks: List[Check] = []
++        self.coverage = 0.0
+         self._404_status: Optional[int] = None
+ 
+     # ------------------------------------------------------------------ util
+     def add(self, id, category, title, severity, status, detail, fix, affected=None, weight=1.0):
+-        self.checks.append(Check(id, category, title, severity, status, detail, fix,
+-                                 affected or [], weight))
++        # One choke point: nothing reaches the PDF, the JSON or the CSV carrying a
++        # credential, a session token or a private query value.
++        safe = [redact_url(str(a)) for a in (affected or [])]
++        self.checks.append(Check(id, category, title, severity, status, detail, fix, safe, weight))
++
++    def _skip(self, id, category, title, severity, fix, reason, weight=1.0):
++        self.add(id, category, title, severity, "skip", reason, fix, [], weight)
+ 
+     def _fetch_status(self, url: str) -> int:
+         try:
+-            r = requests.get(url, headers={"User-Agent": UA}, timeout=self.timeout, allow_redirects=True)
++            r = requests.get(url, headers={"User-Agent": UA}, timeout=self.timeout,
++                             allow_redirects=True)
+             return r.status_code
+         except requests.RequestException:
+             return 0
+ 
+     # ---------------------------------------------------------------- checks
+     def run(self) -> List[Check]:
++        if not self.ok_pages:
++            raise AuditError(
++                "No page could be fetched, so there is nothing to measure. "
++                "Refusing to produce a score \u2014 a number here would be invented.")
++        if not self.content_pages:
++            raise AuditError(
++                "Every page returned almost no readable HTML: the content is built in the "
++                "browser. A crawler cannot audit that, and a score here would describe the "
++                "crawler rather than the site. Render or prerender the pages, or use a "
++                "JavaScript-capable crawler. Nothing was scored.")
+         self.check_https()
+         self.check_robots()
+         self.check_sitemap()
+@@ -369,6 +507,7 @@ class Analyzer:
+         self.check_h1()
+         self.check_headings()
+         self.check_alt()
++        self.check_jsrender()
+         self.check_internal_links()
+         self.check_thin_content()
+         self.check_jsonld()
+@@ -381,6 +520,13 @@ class Analyzer:
+         return self.checks
+ 
+     def check_https(self):
++        if is_private_origin(self.c.start):
++            return self._skip(
++                "https", "Technical", "HTTPS on every page", "critical",
++                "Serve the whole site over HTTPS and 301-redirect http:// to https://.",
++                f"Not measured \u2014 the crawl ran against {redact_url(self.c.start)}, a local "
++                f"or private address. HTTPS on a staging copy says nothing about the public "
++                f"domain, so this check cannot be graded.", 1.4)
+         bad = [p.url for p in self.ok_pages if not p.https]
+         self.add("https", "Technical", "HTTPS on every page", "critical",
+                  "fail" if bad else "pass",
+@@ -393,8 +539,8 @@ class Analyzer:
+         exists = bool(self.c.robots_url) and self._fetch_status(self.c.robots_url) == 200
+         self.add("robots", "Technical", "robots.txt reachable", "high",
+                  "pass" if exists else "fail",
+-                 f"{self.c.robots_url} returns 200." if exists
+-                 else "No robots.txt found — search engines get no crawl guidance.",
++                 f"{redact_url(self.c.robots_url)} returns 200." if exists
++                 else "No robots.txt found \u2014 search engines get no crawl guidance.",
+                  "Publish a robots.txt that allows crawling and points to your sitemap.",
+                  [] if exists else [self.c.robots_url], 1.0)
+ 
+@@ -405,21 +551,24 @@ class Analyzer:
+         for url in candidates:
+             try:
+                 r = requests.get(url, headers={"User-Agent": UA}, timeout=self.timeout)
+-                if r.status_code == 200 and "<url" in r.text.lower():
++                body = r.text.lower()
++                if r.status_code == 200 and "<loc" in body:
+                     found = url
+-                    count = r.text.lower().count("<url>")
++                    count = body.count("<loc")
+                     break
+             except requests.RequestException:
+                 continue
+         self.add("sitemap", "Technical", "XML sitemap present", "high",
+                  "pass" if found else "fail",
+-                 f"{found} lists {count} URLs." if found else "No usable sitemap.xml was found.",
++                 f"{redact_url(found)} lists {count} URLs." if found
++                 else "No usable sitemap.xml was found.",
+                  "Publish an XML sitemap, list every indexable page, and submit it in Search Console.",
+                  [] if found else [candidates[0]], 1.2)
+ 
+     def check_404(self):
+         parsed = urlparse(self.base)
+-        probe = f"{parsed.scheme}://{parsed.netloc}/kovik-audit-missing-page-{abs(hash(self.base)) % 9999}"
++        probe_id = int(hashlib.md5(self.base.encode("utf-8")).hexdigest()[:6], 16) % 99999
++        probe = f"{parsed.scheme}://{parsed.netloc}/kovik-audit-missing-page-{probe_id}"
+         code = self._fetch_status(probe)
+         self._404_status = code
+         ok = code == 404
+@@ -431,13 +580,14 @@ class Analyzer:
+                  [], 0.8)
+ 
+     def check_status_codes(self):
+-        bad = [p for p in self.pages if p.status >= 400]
++        bad = [p for p in self.pages if p.status >= 400 or p.error]
++        detail = ("All crawled pages returned a healthy status." if not bad else
++                  f"{len(bad)} of {len(self.pages)} crawled pages could not be retrieved.")
+         self.add("status", "Technical", "No broken pages in the crawl", "critical",
+-                 "pass" if not bad else "fail",
+-                 "All crawled pages returned a healthy status." if not bad
+-                 else f"{len(bad)} crawled pages returned an error status.",
++                 "pass" if not bad else "fail", detail,
+                  "Fix or redirect every URL that returns 4xx or 5xx.",
+-                 [f"{short(p.url)} → HTTP {p.status}" for p in bad], 1.5)
++                 [f"{short(p.url)} \u2192 {('HTTP ' + str(p.status)) if p.status else (p.error or 'no response')}"
++                  for p in bad], 1.5)
+ 
+     def check_redirects(self):
+         red = [p for p in self.ok_pages if p.redirect_chain]
+@@ -485,20 +635,24 @@ class Analyzer:
+                  [short(p.url) for p in bad], 0.5)
+ 
+     # --------------------------------------------------------------- on-page
++    @_content_check("title", "On-page", "Title tags present and well sized", "critical",
++                    "Write a unique 30\u201360 character title per page: service + city + brand.", 1.6)
+     def check_titles(self):
+-        missing = [p for p in self.ok_pages if not p.title]
+-        short_t = [p for p in self.ok_pages if 0 < len(p.title) < 25]
+-        long_t = [p for p in self.ok_pages if len(p.title) > 62]
++        missing = [p for p in self.content_pages if not p.title]
++        short_t = [p for p in self.content_pages if 0 < len(p.title) < 25]
++        long_t = [p for p in self.content_pages if len(p.title) > 62]
+         status = "fail" if missing else ("warn" if (short_t or long_t) else "pass")
+         detail = "Every page has a title of a sensible length." if status == "pass" else \
+             f"{len(missing)} pages without a title, {len(short_t)} too short, {len(long_t)} too long."
+         self.add("title", "On-page", "Title tags present and well sized", "critical", status, detail,
+-                 "Write a unique 30–60 character title per page: service + city + brand.",
++                 "Write a unique 30\u201360 character title per page: service + city + brand.",
+                  [short(p.url) for p in (missing + short_t + long_t)], 1.6)
+ 
++    @_content_check("title_dupes", "On-page", "No duplicate title tags", "high",
++                    "Give every page its own title; duplicates compete with each other.", 1.2)
+     def check_title_dupes(self):
+         seen: Dict[str, List[str]] = {}
+-        for p in self.ok_pages:
++        for p in self.content_pages:
+             if p.title:
+                 seen.setdefault(p.title.strip().lower(), []).append(short(p.url))
+         dupes = {k: v for k, v in seen.items() if len(v) > 1}
+@@ -509,20 +663,24 @@ class Analyzer:
+                  "Give every page its own title; duplicates compete with each other.",
+                  [u for v in dupes.values() for u in v], 1.2)
+ 
++    @_content_check("description", "On-page", "Meta descriptions written", "high",
++                    "Write a 120\u2013160 character description that gives a reason to click.", 1.3)
+     def check_descriptions(self):
+-        missing = [p for p in self.ok_pages if not p.meta_description]
+-        short_d = [p for p in self.ok_pages if 0 < len(p.meta_description) < 70]
+-        long_d = [p for p in self.ok_pages if len(p.meta_description) > 165]
++        missing = [p for p in self.content_pages if not p.meta_description]
++        short_d = [p for p in self.content_pages if 0 < len(p.meta_description) < 70]
++        long_d = [p for p in self.content_pages if len(p.meta_description) > 165]
+         status = "fail" if missing else ("warn" if (short_d or long_d) else "pass")
+         self.add("description", "On-page", "Meta descriptions written", "high", status,
+                  "Every page has a well-sized meta description." if status == "pass" else
+                  f"{len(missing)} pages without one, {len(short_d)} too short, {len(long_d)} too long.",
+-                 "Write a 120–160 character description that gives a reason to click.",
++                 "Write a 120\u2013160 character description that gives a reason to click.",
+                  [short(p.url) for p in (missing + short_d + long_d)], 1.3)
+ 
++    @_content_check("desc_dupes", "On-page", "No duplicate meta descriptions", "medium",
++                    "Write a distinct description for each page.", 0.8)
+     def check_desc_dupes(self):
+         seen: Dict[str, List[str]] = {}
+-        for p in self.ok_pages:
++        for p in self.content_pages:
+             if p.meta_description:
+                 seen.setdefault(p.meta_description.strip().lower(), []).append(short(p.url))
+         dupes = {k: v for k, v in seen.items() if len(v) > 1}
+@@ -533,9 +691,11 @@ class Analyzer:
+                  "Write a distinct description for each page.",
+                  [u for v in dupes.values() for u in v], 0.8)
+ 
++    @_content_check("h1", "On-page", "One clear H1 per page", "high",
++                    "Use a single H1 that states the page's subject, then H2 for sections.", 1.3)
+     def check_h1(self):
+-        none = [p for p in self.ok_pages if not p.h1]
+-        many = [p for p in self.ok_pages if len(p.h1) > 1]
++        none = [p for p in self.content_pages if not p.h1]
++        many = [p for p in self.content_pages if len(p.h1) > 1]
+         status = "fail" if none else ("warn" if many else "pass")
+         self.add("h1", "On-page", "One clear H1 per page", "high", status,
+                  "Every page has exactly one H1." if status == "pass" else
+@@ -543,8 +703,10 @@ class Analyzer:
+                  "Use a single H1 that states the page's subject, then H2 for sections.",
+                  [short(p.url) for p in (none + many)], 1.3)
+ 
++    @_content_check("headings", "On-page", "Sections marked with H2", "low",
++                    "Break content into H2 sections so both readers and crawlers can scan it.", 0.6)
+     def check_headings(self):
+-        no_h2 = [p for p in self.ok_pages if not p.h2]
++        no_h2 = [p for p in self.content_pages if not p.h2]
+         self.add("headings", "On-page", "Sections marked with H2", "low",
+                  "pass" if not no_h2 else "warn",
+                  "Every page has section headings." if not no_h2
+@@ -552,20 +714,46 @@ class Analyzer:
+                  "Break content into H2 sections so both readers and crawlers can scan it.",
+                  [short(p.url) for p in no_h2], 0.6)
+ 
++    @_content_check("alt", "On-page", "Images have alt text", "medium",
++                    "Describe what each image shows; alt text feeds image search and accessibility.", 1.0)
+     def check_alt(self):
+-        total = sum(p.images for p in self.ok_pages)
+-        missing = sum(p.images_no_alt for p in self.ok_pages)
+-        ratio = (missing / total) if total else 0
++        total = sum(p.images for p in self.content_pages)
++        missing = sum(p.images_no_alt for p in self.content_pages)
++        if total == 0:
++            return self.add("alt", "On-page", "Images have alt text", "medium", "info",
++                            "No images on the measured pages, so there is nothing to check.",
++                            "Describe what each image shows; alt text feeds image search.",
++                            [], 1.0)
++        ratio = missing / total
+         status = "pass" if missing == 0 else ("warn" if ratio < 0.3 else "fail")
+-        affected = [f"{short(p.url)} — {p.images_no_alt} of {p.images} images"
+-                    for p in self.ok_pages if p.images_no_alt]
++        affected = [f"{short(p.url)} \u2014 {p.images_no_alt} of {p.images} images"
++                    for p in self.content_pages if p.images_no_alt]
+         self.add("alt", "On-page", "Images have alt text", "medium", status,
+-                 f"{missing} of {total} images have no alt text." if total else "No images found.",
++                 f"{missing} of {total} images have no alt text.",
+                  "Describe what each image shows; alt text feeds image search and accessibility.",
+                  affected, 1.0)
+ 
++    def check_jsrender(self):
++        js = [p for p in self.ok_pages if p.js_only]
++        if not js:
++            return self.add("jsrender", "Content", "Content visible without JavaScript", "high",
++                            "pass",
++                            "Every page returned its content in the first HTML response.",
++                            "Keep the content in the server response so crawlers see it too.",
++                            [], 1.4)
++        status = "fail" if len(js) == len(self.ok_pages) else "warn"
++        self.add("jsrender", "Content", "Content visible without JavaScript", "high", status,
++                 f"{len(js)} of {len(self.ok_pages)} pages returned almost no readable HTML \u2014 "
++                 f"the content is assembled in the browser. Search engines may index an empty "
++                 f"page, and this audit cannot measure those pages.",
++                 "Render the page on the server (SSR or static generation) or prerender it, so "
++                 "the HTML already contains the content.",
++                 [short(p.url) for p in js], 1.4)
++
++    @_content_check("internal_links", "Content", "Pages link to each other", "medium",
++                    "Link related pages from the body copy, not just the menu.", 0.9)
+     def check_internal_links(self):
+-        thin = [p for p in self.ok_pages if p.internal_links < 5]
++        thin = [p for p in self.content_pages if p.internal_links < 5]
+         self.add("internal_links", "Content", "Pages link to each other", "medium",
+                  "pass" if not thin else "warn",
+                  "Every page carries at least five internal links." if not thin
+@@ -573,58 +761,71 @@ class Analyzer:
+                  "Link related pages from the body copy, not just the menu.",
+                  [short(p.url) for p in thin], 0.9)
+ 
++    @_content_check("thin", "Content", "Enough substance on the page", "high",
++                    "Add the detail a customer needs: what is included, prices, timings, proof.", 1.2)
+     def check_thin_content(self):
+-        thin = [p for p in self.ok_pages if p.words < 300]
++        thin = [p for p in self.content_pages if p.words < 300]
+         status = "pass" if not thin else ("warn" if len(thin) <= 2 else "fail")
+         self.add("thin", "Content", "Enough substance on the page", "high", status,
+                  "Every page carries at least 300 words." if not thin
+                  else f"{len(thin)} pages carry under 300 words of visible text.",
+                  "Add the detail a customer needs: what is included, prices, timings, proof.",
+-                 [f"{short(p.url)} — {p.words} words" for p in thin], 1.2)
++                 [f"{short(p.url)} \u2014 {p.words} words" for p in thin], 1.2)
+ 
+     # ------------------------------------------------------- structured data
++    @_content_check("jsonld", "Structured data", "Schema.org markup", "high",
++                    "Add LocalBusiness/Organization plus page-type schema, and validate it.", 1.3)
+     def check_jsonld(self):
+-        missing = [p for p in self.ok_pages if not p.jsonld_blocks]
+-        invalid = [p for p in self.ok_pages if p.jsonld_blocks and p.jsonld_valid < len(p.jsonld_blocks)]
++        missing = [p for p in self.content_pages if not p.jsonld_blocks]
++        invalid = [p for p in self.content_pages
++                   if p.jsonld_blocks and p.jsonld_valid < len(p.jsonld_blocks)]
+         status = "pass" if not missing and not invalid else ("warn" if not missing else "fail")
+-        types = sorted({t for p in self.ok_pages for t in p.jsonld_types})
++        types = sorted({t for p in self.content_pages for t in p.jsonld_types})
+         self.add("jsonld", "Structured data", "Schema.org markup", "high", status,
+                  (f"Valid JSON-LD on every page. Types found: {', '.join(types[:8])}." if status == "pass"
+                   else f"{len(missing)} pages have no JSON-LD; {len(invalid)} have invalid blocks."),
+                  "Add LocalBusiness/Organization plus page-type schema, and validate it.",
+                  [short(p.url) for p in (missing + invalid)], 1.3)
+ 
++    @_content_check("og", "Structured data", "Open Graph tags for sharing", "low",
++                    "Add og:title, og:description and a 1200\u00d7630 og:image to every page.", 0.7)
+     def check_og(self):
+         need = ["og:title", "og:description", "og:image"]
+-        bad = [p for p in self.ok_pages if any(k not in p.og_tags for k in need)]
++        bad = [p for p in self.content_pages if any(k not in p.og_tags for k in need)]
+         self.add("og", "Structured data", "Open Graph tags for sharing", "low",
+                  "pass" if not bad else "warn",
+                  "Every page is ready to share." if not bad
+                  else f"{len(bad)} pages are missing some Open Graph tags.",
+-                 "Add og:title, og:description and a 1200×630 og:image to every page.",
++                 "Add og:title, og:description and a 1200\u00d7630 og:image to every page.",
+                  [short(p.url) for p in bad], 0.7)
+ 
++    @_content_check("local_schema", "Structured data", "Local business identity markup", "medium",
++                    "Declare your business once \u2014 name, address, phone, hours, area served.", 0.9)
+     def check_local_schema(self):
+         local_types = {"LocalBusiness", "ProfessionalService", "Store", "MedicalBusiness",
+                        "Restaurant", "Dentist", "Organization"}
+-        found = any(local_types & set(p.jsonld_types) for p in self.ok_pages)
++        found = any(local_types & set(p.jsonld_types) for p in self.content_pages)
+         self.add("local_schema", "Structured data", "Local business identity markup", "medium",
+                  "pass" if found else "warn",
+                  "A business entity type is declared." if found
+                  else "No LocalBusiness or Organization entity was found in the markup.",
+-                 "Declare your business once — name, address, phone, hours, area served.",
++                 "Declare your business once \u2014 name, address, phone, hours, area served.",
+                  [], 0.9)
+ 
+     # ---------------------------------------------------------- performance
+     def check_speed(self):
+         times = [p.elapsed_ms for p in self.ok_pages if p.elapsed_ms]
+-        avg = int(sum(times) / len(times)) if times else 0
++        if not times:
++            return self._skip("speed", "Performance", "Server responds quickly", "high",
++                              "Move to a host close to your customers and enable server-side caching.",
++                              "Not measured \u2014 no response times were recorded.", 1.3)
++        avg = int(sum(times) / len(times))
+         slow = [p for p in self.ok_pages if p.elapsed_ms > 1200]
+-        status = "pass" if avg and avg < 800 and not slow else ("warn" if avg < 1500 else "fail")
++        status = "pass" if avg < 800 and not slow else ("warn" if avg < 1500 else "fail")
+         self.add("speed", "Performance", "Server responds quickly", "high", status,
+                  f"Average response time {avg} ms across {len(times)} pages.",
+                  "Move to a host close to your customers and enable server-side caching.",
+-                 [f"{short(p.url)} — {p.elapsed_ms} ms" for p in slow], 1.3)
++                 [f"{short(p.url)} \u2014 {p.elapsed_ms} ms" for p in slow], 1.3)
+ 
+     def check_weight(self):
+         heavy = [p for p in self.ok_pages if p.bytes > 500_000]
+@@ -633,41 +834,67 @@ class Analyzer:
+         self.add("weight", "Performance", "Page weight under control", "medium", status,
+                  f"Average HTML weight {avg_kb} KB; {len(heavy)} pages above 500 KB.",
+                  "Compress images, drop unused scripts and defer what is not needed first.",
+-                 [f"{short(p.url)} — {p.bytes // 1024} KB" for p in heavy], 1.0)
++                 [f"{short(p.url)} \u2014 {p.bytes // 1024} KB" for p in heavy], 1.0)
+ 
+     def check_compression(self):
+         enc = [p.headers.get("content-encoding", "") for p in self.ok_pages]
+         good = sum(1 for e in enc if any(k in e for k in ("gzip", "br", "zstd")))
+-        status = "pass" if self.ok_pages and good == len(self.ok_pages) else ("warn" if good else "fail")
++        status = "pass" if good == len(self.ok_pages) else ("warn" if good else "fail")
+         self.add("compression", "Performance", "Text compression enabled", "medium", status,
+                  f"{good} of {len(self.ok_pages)} pages were served compressed.",
+-                 "Enable gzip or brotli on the server — it usually halves transfer size.",
+-                 [], 0.9)
++                 "Enable gzip or brotli on the server \u2014 it usually halves transfer size.",
++                 [short(p.url) for p in self.ok_pages
++                  if not any(k in p.headers.get("content-encoding", "") for k in ("gzip", "br", "zstd"))],
++                 0.9)
+ 
+     def check_cache(self):
+         cached = [p for p in self.ok_pages if p.headers.get("cache-control")]
+-        status = "pass" if self.ok_pages and len(cached) == len(self.ok_pages) else "warn"
++        status = "pass" if len(cached) == len(self.ok_pages) else "warn"
+         self.add("cache", "Performance", "Cache headers set", "low", status,
+                  f"{len(cached)} of {len(self.ok_pages)} pages send a Cache-Control header.",
+                  "Set long cache lifetimes on assets and a short one on HTML.",
+-                 [], 0.6)
++                 [short(p.url) for p in self.ok_pages if not p.headers.get("cache-control")], 0.6)
+ 
+     # -------------------------------------------------------------- scoring
+     def scores(self) -> Dict[str, float]:
+-        out = {}
++        """Category and overall scores over MEASURED checks only.
++
++        Checks that could not be measured are left out of both the numerator and
++        the denominator. A category with nothing measured is dropped and the
++        remaining weights are renormalised, so a missing check can never be
++        mistaken for a good one.
++        """
++        out: Dict[str, Optional[float]] = {}
++        measured_cat_weight = 0.0
++        measured_total = 0.0
++        possible_total = 0.0
++
+         for cat, weight in WEIGHTS.items():
+-            items = [c for c in self.checks if c.category == cat]
++            all_items = [c for c in self.checks if c.category == cat]
++            items = [c for c in all_items if c.status not in UNMEASURED]
++            possible_total += weight * sum(c.weight for c in all_items)
++            measured_total += weight * sum(c.weight for c in items)
+             if not items:
+-                out[cat] = 0.0
++                out[cat] = None
+                 continue
+             num = sum(STATUS_VALUE[c.status] * c.weight for c in items)
+             den = sum(c.weight for c in items)
+             out[cat] = round(100 * num / den, 1)
+-        overall = sum(out[c] * w for c, w in WEIGHTS.items())
+-        out["Overall"] = round(overall, 1)
++            measured_cat_weight += weight
++
++        self.coverage = round(measured_total / possible_total, 3) if possible_total else 0.0
++
++        if measured_cat_weight <= 0:
++            out["Overall"] = None
++            return out
++
++        overall = sum(out[c] * w for c, w in WEIGHTS.items() if out.get(c) is not None)
++        out["Overall"] = round(overall / measured_cat_weight, 1)
+         return out
+ 
+-    def grade(self, score: float) -> str:
++    def grade(self, score: Optional[float]) -> str:
++        if score is None:
++            return "Not scored"
+         if score >= 85:
+             return "Strong"
+         if score >= 70:
+@@ -680,9 +907,43 @@ class Analyzer:
+         items = [c for c in self.checks if c.status in ("fail", "warn")] if only_failing else list(self.checks)
+         return sorted(items, key=lambda c: (SEVERITY_ORDER.get(c.severity, 9), c.status != "fail"))
+ 
++    def unmeasured(self) -> List[Check]:
++        return [c for c in self.checks if c.status in UNMEASURED]
++
+     def page_rows(self) -> List[dict]:
++        """One row per crawled URL \u2014 including the ones that failed or need JavaScript.
++
++        Failed pages used to vanish from this table, so the report claimed more
++        pages than it showed and every hidden page looked clean.
++        """
+         rows = []
+-        for p in self.ok_pages:
++        for p in self.pages:
++            row = {
++                "url": redact_url(p.url),
++                "status": p.status or 0,
++                "score": None,
++                "title_len": len(p.title),
++                "desc_len": len(p.meta_description),
++                "h1": len(p.h1),
++                "words": p.words,
++                "imgs": p.images,
++                "no_alt": p.images_no_alt,
++                "ms": p.elapsed_ms,
++                "kb": round(p.bytes / 1024),
++                "jsonld": len(p.jsonld_blocks),
++                "flag": "",
++                "note": "",
++            }
++            if p.status >= 400 or p.error:
++                row["flag"] = "failed"
++                row["note"] = p.error or f"HTTP {p.status}"
++                rows.append(row)
++                continue
++            if p.js_only:
++                row["flag"] = "js"
++                row["note"] = "content built in the browser \u2014 not measured"
++                rows.append(row)
++                continue
+             problems = 0
+             if not p.title:
+                 problems += 1
+@@ -698,21 +959,8 @@ class Analyzer:
+                 problems += 1
+             if not p.jsonld_blocks:
+                 problems += 1
+-            score = max(0, 100 - problems * 14)
+-            rows.append({
+-                "url": p.url,
+-                "status": p.status,
+-                "score": score,
+-                "title_len": len(p.title),
+-                "desc_len": len(p.meta_description),
+-                "h1": len(p.h1),
+-                "words": p.words,
+-                "imgs": p.images,
+-                "no_alt": p.images_no_alt,
+-                "ms": p.elapsed_ms,
+-                "kb": round(p.bytes / 1024),
+-                "jsonld": len(p.jsonld_blocks),
+-            })
++            row["score"] = max(0, 100 - problems * 14)
++            rows.append(row)
+         return rows
+ 
+ # ==========================================================================
+@@ -767,9 +1015,11 @@ class AuditReport:
+                  powered_by="Kovik Intelligence AI", site_name="kovik.online",
+                  client: str = "", display_site: str = ""):
+         self.a = analyzer
+-        self.site = display_site or site_url
++        self.measured = site_url
++        self.label = (display_site or "").strip()
++        self.site = self.label or site_url
+         self._origin = analyzer.base
+-        self._disp_origin = (display_site or site_url).rstrip("/")
++        self._mirrored = bool(self.label) and not same_host(self.label, analyzer.base)
+         self.brand = brand
+         self.powered = powered_by
+         self.site_name = site_name
+@@ -781,10 +1031,22 @@ class AuditReport:
+         self.styles = self._styles()
+ 
+     def disp(self, url: str) -> str:
+-        """Show the public URL in the report even when the crawl ran on a mirror."""
+-        if self._disp_origin and self._origin and self._origin != self._disp_origin:
+-            return url.replace(self._origin.rstrip("/"), self._disp_origin)
+-        return url
++        """Print the URL exactly as it was measured, minus anything secret.
++
++        A --label used to rewrite the host of every finding, so a crawl of
++        127.0.0.1 was reported as "kovik.online is served over plain HTTP" — a
++        false critical finding about the live domain. The label is a caption now,
++        and this only redacts.
++        """
++        return redact_url(url)
++
++    def _mirror_note(self) -> str:
++        if not self._mirrored:
++            return ""
++        return (f"<b>Measured on {redact_url(self.measured)}</b>, a copy of "
++                f"{redact_url(self.label)}. Every URL below is the address that was actually "
++                f"fetched. Findings about HTTPS, robots.txt and the sitemap describe that copy, "
++                f"not the public domain.")
+ 
+     # ---------------------------------------------------------------- styles
+     def _styles(self):
+@@ -809,8 +1071,10 @@ class AuditReport:
+ 
+     # --------------------------------------------------------------- charts
+     def _chart_scores(self) -> str:
+-        cats = [c for c in self.scores if c != "Overall"]
++        cats = [c for c in WEIGHTS if self.scores.get(c) is not None]
+         vals = [self.scores[c] for c in cats]
++        if not cats:
++            return ""
+         fig, ax = plt.subplots(figsize=(6.4, 2.5), dpi=200)
+         fig.patch.set_facecolor("white")
+         bars = ax.barh(cats, vals, color="#2fbfa4", height=0.55)
+@@ -941,29 +1205,33 @@ class AuditReport:
+         c.setStrokeColor(colors.HexColor("#1e332e"))
+         c.setLineWidth(7)
+         c.circle(cx, cy, r, stroke=1, fill=0)
++        overall = self.scores.get("Overall")
+         c.setStrokeColor(MINT)
+-        frac = max(0.0, min(1.0, self.scores["Overall"] / 100.0))
++        frac = max(0.0, min(1.0, (overall or 0.0) / 100.0))
+         c.setLineWidth(7)
+         c.arc(cx - r, cy - r, cx + r, cy + r, startAng=90, extent=-360 * frac)
+         c.setFillColor(colors.white)
+         c.setFont("Helvetica-Bold", 30)
+-        c.drawCentredString(cx, cy + 2 * mm, f"{self.scores['Overall']:.0f}")
++        c.drawCentredString(cx, cy + 2 * mm, f"{overall:.0f}" if overall is not None else "—")
+         c.setFillColor(colors.HexColor("#9fb4ad"))
+         c.setFont("Helvetica", 7)
+-        c.drawCentredString(cx, cy - 8 * mm, "OUT OF 100")
++        c.drawCentredString(cx, cy - 8 * mm, "OUT OF 100" if overall is not None else "NOT SCORED")
+         c.setFillColor(MINT)
+         c.setFont("Helvetica-Bold", 9)
+-        c.drawCentredString(cx, cy - r - 9 * mm, self.a.grade(self.scores["Overall"]).upper())
++        c.drawCentredString(cx, cy - r - 9 * mm, self.a.grade(overall).upper())
+ 
+         # facts
+         c.setFillColor(colors.HexColor("#8ba39b"))
+         c.setFont("Helvetica", 9)
++        measured = sum(1 for c in self.a.checks if c.status not in UNMEASURED)
+         lines = [
+             f"Date of audit      {self.date}",
+-            f"Pages crawled      {len(self.a.ok_pages)}",
+-            f"Checks run         {len(self.a.checks)}",
++            f"Pages fetched      {len(self.a.ok_pages)} of {len(self.a.pages)} tried",
++            f"Checks measured    {measured} of {len(self.a.checks)}",
+             f"Issues found       {len(self.issues)}",
+         ]
++        if self._mirrored:
++            lines.append(f"Measured on        {redact_url(self.measured)[:44]}")
+         yy = h - 132 * mm
+         for ln in lines:
+             c.drawString(20 * mm, yy, ln)
+@@ -973,7 +1241,7 @@ class AuditReport:
+         inside = [
+             "Executive summary with a weighted score across five categories",
+             f"{len(self.issues)} findings, each with the evidence and the fix",
+-            f"Page-by-page table for {len(self.a.ok_pages)} crawled pages",
++            f"Page-by-page table for {len(self.a.pages)} crawled URLs",
+             "Method, scoring weights and the limits of this audit",
+         ]
+         c.setFillColor(MINT)
+@@ -1035,14 +1303,20 @@ class AuditReport:
+         story: List = []
+         story.append(Paragraph("Executive summary", s["KH1"]))
+         story.append(Paragraph(
+-            f"A technical and on-page audit of <b>{self.site}</b>, covering "
+-            f"{len(self.a.ok_pages)} crawled pages. Every finding below was measured, not assumed — "
+-            f"each check records what was found on the page and what to change.", s["KBody"]))
++            f"A technical and on-page audit of <b>{redact_url(self.site)}</b>, covering "
++            f"{len(self.a.ok_pages)} fetched pages. Every finding below was measured, not assumed — "
++            f"each check records what was found on the page and what to change. Checks that could "
++            f"not be measured are listed as such and left out of the score rather than counted as "
++            f"passes.", s["KBody"]))
++        if self._mirrored:
++            story.append(Spacer(1, 3 * mm))
++            story.append(Paragraph(self._mirror_note(), s["KSmall"]))
+         story.append(Spacer(1, 6 * mm))
+ 
+-        overall = self.scores["Overall"]
++        overall = self.scores.get("Overall")
++        score_txt = f"{overall:.0f}" if overall is not None else "—"
+         head = Table(
+-            [[Paragraph(f'<font size="30" color="#0b1210"><b>{overall:.0f}</b></font>'
++            [[Paragraph(f'<font size="30" color="#0b1210"><b>{score_txt}</b></font>'
+                         f'<font size="11" color="#5c6a64"> / 100</font>', s["KCell"]),
+               Paragraph(f'<b>{self.a.grade(overall)}</b><br/>'
+                         f'<font size="8" color="#5c6a64">Overall visibility score</font>', s["KCell"]),
+@@ -1063,8 +1337,9 @@ class AuditReport:
+         story.append(Spacer(1, 7 * mm))
+ 
+         chart = self._chart_scores()
+-        story.append(Image(chart, width=165 * mm, height=64 * mm))
+-        story.append(Spacer(1, 4 * mm))
++        if chart:
++            story.append(Image(chart, width=165 * mm, height=64 * mm))
++            story.append(Spacer(1, 4 * mm))
+ 
+         # priorities
+         story.append(Paragraph("Fix these first", s["KH2"]))
+@@ -1178,11 +1453,20 @@ class AuditReport:
+                                  "structural problems.", s["KBody"]), Spacer(1, 4 * mm)]
+         rows = [[Paragraph(h, s["KCellB"]) for h in
+                  ["URL", "Status", "Score", "Title", "Desc", "H1", "Words", "Alt gaps", "ms", "KB"]]]
++        flagged = []
+         for r in self.a.page_rows():
++            if r["flag"] == "js":
++                status_txt, score_txt = "JS", "—"
++            elif r["flag"] == "failed":
++                status_txt, score_txt = (str(r["status"]) if r["status"] else "ERR"), "—"
++            else:
++                status_txt, score_txt = str(r["status"]), f"<b>{r['score']}</b>"
++            if r["flag"]:
++                flagged.append(r)
+             rows.append([
+                 Paragraph(self.disp(r["url"]).replace("&", "&amp;")[:64], s["KCell"]),
+-                Paragraph(str(r["status"]), s["KCell"]),
+-                Paragraph(f"<b>{r['score']}</b>", s["KCell"]),
++                Paragraph(status_txt, s["KCell"]),
++                Paragraph(score_txt, s["KCell"]),
+                 Paragraph(str(r["title_len"]), s["KCell"]),
+                 Paragraph(str(r["desc_len"]), s["KCell"]),
+                 Paragraph(str(r["h1"]), s["KCell"]),
+@@ -1204,30 +1488,56 @@ class AuditReport:
+             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafbfa")]),
+         ]))
+         story.append(t)
++        if flagged:
++            kinds = {r["flag"] for r in flagged}
++            note = []
++            if "js" in kinds:
++                note.append("<b>JS</b> means the content is assembled in the browser and could "
++                            "not be measured.")
++            if "failed" in kinds:
++                note.append("A page that did not load keeps its error status and no score.")
++            note.append("Neither is scored, and neither counts as a pass.")
++            story.append(Spacer(1, 2 * mm))
++            story.append(Paragraph(" ".join(note), s["KSmall"]))
+         story.append(PageBreak())
+         return story
+ 
+     # -------------------------------------------------------------- method
+     def _method_section(self) -> List:
+         s = self.styles
++        measured = sum(1 for c in self.a.checks if c.status not in UNMEASURED)
++        skipped = len(self.a.checks) - measured
+         story: List = [Paragraph("Method and limits", s["KH1"]),
+                        Paragraph(
+-                           f"The engine fetched {len(self.a.pages)} pages from {self.site} "
+-                           f"(same host only, robots.txt respected, {self.a.c.max_depth} levels deep), "
+-                           f"parsed the HTML, and ran {len(self.a.checks)} checks. Response times are "
+-                           f"a single measurement from one location at one moment — treat them as a "
+-                           f"signal, not a benchmark.", s["KBody"]),
+-                       Spacer(1, 3 * mm),
+-                       Paragraph("<b>What this audit does not cover:</b> backlinks and authority, "
+-                                 "search volume and keyword difficulty, competitor rankings, "
+-                                 "Core Web Vitals field data from real users, paid search, or "
+-                                 "Google Business Profile performance. Those need Search Console, "
+-                                 "Analytics and a rank-tracking source.", s["KBody"]),
+-                       Spacer(1, 3 * mm),
+-                       Paragraph("<b>Scores</b> are a weighted average: Technical 30%, On-page 25%, "
+-                                 "Content 20%, Structured data 15%, Performance 10%. A pass scores 1, "
+-                                 "an improvement 0.5, a failure 0.", s["KBody"]),
+-                       Spacer(1, 8 * mm)]
++                           f"The engine fetched {len(self.a.ok_pages)} pages from "
++                           f"{redact_url(self.measured)} (same host only, robots.txt respected, "
++                           f"{self.a.c.max_depth} levels deep), parsed the HTML, and ran "
++                           f"{len(self.a.checks)} checks. {measured} of them could be measured; "
++                           f"{skipped} could not, and are excluded from the score. Response times "
++                           f"are a single measurement from one location at one moment — treat "
++                           f"them as a signal, not a benchmark.", s["KBody"]),
++                       Spacer(1, 3 * mm)]
++        if self.a.c.failed:
++            failed = "; ".join(redact_url(f["url"]) + " (" +
++                               (f["error"] or "HTTP " + str(f["status"])) + ")"
++                               for f in self.a.c.failed[:6])
++            story.append(Paragraph(
++                f"<b>Pages that did not load:</b> {failed}. They are counted as broken, not "
++                f"as clean.", s["KSmall"]))
++            story.append(Spacer(1, 3 * mm))
++        story += [
++            Paragraph("<b>What this audit does not cover:</b> backlinks and authority, "
++                      "search volume and keyword difficulty, competitor rankings, "
++                      "Core Web Vitals field data from real users, paid search, or "
++                      "Google Business Profile performance. Those need Search Console, "
++                      "Analytics and a rank-tracking source.", s["KBody"]),
++            Spacer(1, 3 * mm),
++            Paragraph("<b>Scores</b> are a weighted average: Technical 30%, On-page 25%, "
++                      "Content 20%, Structured data 15%, Performance 10%. A pass scores 1, "
++                      "an improvement 0.5, a failure 0. A check that could not be measured "
++                      "scores nothing and is removed from both sides of the average, so a "
++                      "page that never loaded can never lift a score.", s["KBody"]),
++            Spacer(1, 8 * mm)]
+         box = Table([[Paragraph(
+             f"<b>Prepared by {self.brand}</b><br/>"
+             f"Hajipur, Bihar · kovik.online · +91 91992 64615<br/>"
+@@ -1273,8 +1583,9 @@ def banner():
+ 
+ def main(argv=None):
+     ap = argparse.ArgumentParser(
+-        prog="audit.py",
+-        description="Crawl a website and produce a scored SEO audit report (PDF, JSON, CSV).")
++        prog="kovik_audit.py",
++        description="Crawl a website and produce a scored SEO audit report (PDF, JSON, CSV). "
++                    "Refuses to score a site it could not fetch.")
+     ap.add_argument("url", help="Start URL, e.g. https://example.com")
+     ap.add_argument("--pages", type=int, default=10, help="Maximum pages to crawl (default 10)")
+     ap.add_argument("--depth", type=int, default=2, help="Link depth from the start URL (default 2)")
+@@ -1285,8 +1596,9 @@ def main(argv=None):
+     ap.add_argument("--client", default="", help="Client name shown on the cover")
+     ap.add_argument("--delay", type=float, default=0.4, help="Seconds between requests (be polite)")
+     ap.add_argument("--quiet", action="store_true", help="Suppress crawl progress")
+-    ap.add_argument("--label", default="", help="Public URL to show on the report "
+-                                               "(useful when auditing a staging copy)")
++    ap.add_argument("--label", default="",
++                    help="Public URL to caption the report with when you audit a staging copy. "
++                         "Caption only: every measured URL is printed exactly as it was fetched.")
+     args = ap.parse_args(argv)
+ 
+     if not args.url.startswith(("http://", "https://")):
+@@ -1298,54 +1610,105 @@ def main(argv=None):
+                       delay=args.delay, verbose=not args.quiet)
+     print(color("Crawling", C_BOLD))
+     crawler.run()
+-    if not crawler.pages:
+-        print(color("Could not fetch the site. Check the URL and the connection.", C_CLAY))
++
++    # ---- gate 1: the page we were asked to audit has to have actually loaded.
++    start_page = next((p for p in crawler.pages if p.url == crawler.start), None)
++    if start_page is None or start_page.status >= 400 or start_page.error:
++        reason = (start_page.error or f"HTTP {start_page.status}") if start_page \
++            else "the start URL was never fetched"
++        reason = reason.split(")")[0][:120] if "(" in reason[:60] else reason[:120]
++        print(color(f"\n  Cannot audit {redact_url(args.url)} \u2014 {reason}", C_CLAY))
++        print(color("  No page was measured, so no score and no report were written.", C_CLAY))
++        if crawler.failed:
++            for f in crawler.failed[:5]:
++                print(color(f"    {redact_url(f['url'])} \u2014 "
++                            f"{f['error'] or 'HTTP ' + str(f['status'])}", C_DIM))
++        print()
+         return 2
+ 
+-    print(color(f"\nAnalysing {len(crawler.pages)} pages", C_BOLD))
++    ok_pages = [p for p in crawler.pages if p.status < 400 and not p.error]
++    js_pages = [p for p in ok_pages if p.js_only]
++    failed = len(crawler.pages) - len(ok_pages)
++    line = f"\n  Fetched {len(ok_pages)} of {len(crawler.pages)} pages"
++    if failed:
++        line += f"  \u00b7  {failed} failed"
++    if js_pages:
++        line += f"  \u00b7  {len(js_pages)} rendered in the browser"
++    print(color(line, C_BOLD))
++
++    # ---- gate 2: the engine itself refuses to analyse an empty crawl.
+     analyzer = Analyzer(crawler)
+-    analyzer.run()
++    try:
++        analyzer.run()
++    except AuditError as exc:
++        print(color(f"\n  {exc}", C_CLAY))
++        print()
++        return 2
++
+     scores = analyzer.scores()
+     issues = analyzer.issues()
++    overall = scores.get("Overall")
++
++    # ---- gate 3: not enough of the checklist was measurable to justify a number.
++    if overall is None or analyzer.coverage < MIN_COVERAGE:
++        print(color(f"\n  Only {analyzer.coverage * 100:.0f}% of the checklist could be measured. "
++                    f"That is not enough to publish a score.", C_CLAY))
++        print(color("  Nothing was written. Fix the fetch problem and run it again.", C_DIM))
++        print()
++        return 2
+ 
+     # terminal summary
+     print()
+-    print(f"  Overall score  {color(f'{scores['Overall']:.0f}/100', C_BOLD)}  ({analyzer.grade(scores['Overall'])})")
++    print(f"  Overall score  {color(f'{overall:.0f}/100', C_BOLD)}  ({analyzer.grade(overall)})")
+     for cat in WEIGHTS:
+-        bar = "█" * int(scores[cat] / 5) + "░" * (20 - int(scores[cat] / 5))
+-        print(f"  {cat:<16} {color(bar, C_TEAL)} {scores[cat]:.0f}")
++        v = scores.get(cat)
++        if v is None:
++            print(f"  {cat:<16} {color('not measured', C_DIM)}")
++            continue
++        bar = "\u2588" * int(v / 5) + "\u2591" * (20 - int(v / 5))
++        print(f"  {cat:<16} {color(bar, C_TEAL)} {v:.0f}")
++    print(f"  {'coverage':<16} {analyzer.coverage * 100:.0f}% of the checklist measured")
+     print()
+     fails = [c for c in issues if c.status == "fail"]
+     warns = [c for c in issues if c.status == "warn"]
+-    print(f"  {color(str(len(fails)), C_CLAY)} failing · {len(warns)} to improve")
++    print(f"  {color(str(len(fails)), C_CLAY)} failing \u00b7 {len(warns)} to improve "
++          f"\u00b7 {len(analyzer.unmeasured())} not measurable")
+     for c in issues[:6]:
+         tag = color("FIX ", C_CLAY) if c.status == "fail" else color("IMPR", C_DIM)
+         print(f"    {tag} [{c.severity:<8}] {c.title}")
+     print()
+ 
+-    host = args.url.split("://", 1)[1].split("/")[0].replace("www.", "")
+-    label = args.label.strip()
+-    if label:
+-        host = label.split("://", 1)[-1].split("/")[0].replace("www.", "")
++    host = urlparse(crawler.start).netloc.replace("www.", "") or "site"
+     out = args.out or f"audit-{host}-{time.strftime('%Y%m%d')}.pdf"
+ 
+-    report = AuditReport(analyzer, args.url, brand=args.brand, client=args.client,
+-                         site_name=host, display_site=label or "")
++    report = AuditReport(analyzer, crawler.start, brand=args.brand, client=args.client,
++                         site_name=host, display_site=args.label.strip())
+     report.build(out)
+-    print(f"  PDF  → {color(out, C_BOLD)}")
++    print(f"  PDF  \u2192 {color(out, C_BOLD)}")
+ 
+     if args.json_out:
+         payload = {
+-            "url": args.url,
++            "tool": "Kovik SEO Audit Engine",
++            "schema": 2,
++            "measured_origin": redact_url(crawler.start),
++            "label": args.label.strip(),
+             "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+-            "pages_crawled": len(crawler.pages),
++            "pages_requested": args.pages,
++            "pages_fetched": len(ok_pages),
++            "pages_failed": [{"url": redact_url(f["url"]), "status": f["status"],
++                              "error": f["error"]} for f in crawler.failed],
++            "pages_js_only": [redact_url(p.url) for p in js_pages],
++            "coverage": analyzer.coverage,
++            "score_valid": overall is not None,
+             "scores": scores,
+             "checks": [c.__dict__ for c in analyzer.checks],
+             "pages": analyzer.page_rows(),
++            "redaction": "URL credentials, session tokens and secret query values are removed; "
++                         "page bodies, headers, cookies and raw JSON-LD are never exported.",
+         }
+         with open(args.json_out, "w", encoding="utf-8") as fh:
+             json.dump(payload, fh, indent=2)
+-        print(f"  JSON → {args.json_out}")
++        print(f"  JSON \u2192 {args.json_out}")
+ 
+     if args.csv_out:
+         with open(args.csv_out, "w", newline="", encoding="utf-8") as fh:
+@@ -1353,8 +1716,8 @@ def main(argv=None):
+             w.writerow(["severity", "category", "check", "status", "detail", "fix", "affected"])
+             for c in issues:
+                 w.writerow([c.severity, c.category, c.title, c.status, c.detail, c.fix,
+-                            " | ".join(report.disp(u) for u in c.affected[:10])])
+-        print(f"  CSV  → {args.csv_out}")
++                            " | ".join(redact_url(u) for u in c.affected[:10])])
++        print(f"  CSV  \u2192 {args.csv_out}")
+ 
+     print(color(f"\n  Done in {time.time() - t0:.1f}s\n", C_DIM))
+     return 0
+diff --git a/tests/test_integrity.py b/tests/test_integrity.py
+new file mode 100644
+index 0000000..de57b7e
+--- /dev/null
++++ b/tests/test_integrity.py
+@@ -0,0 +1,178 @@
++"""Regression tests for the scoring and reporting guarantees.
++
++Run from the repo root:
++
++    python -m unittest discover -s tests -v
++
++No network access is used. These cover the failure that shipped in the first
++release: a crawl that fetched nothing still produced a score of 81.
++"""
++import os
++import sys
++import unittest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import kovik_audit as k
++
++
++class FakeCrawler:
++    """Just enough of Crawler for the Analyzer, with no sockets."""
++
++    def __init__(self, pages, start="https://example.in/"):
++        self.pages = pages
++        self.start = start
++        self.robots_url = start.rstrip("/") + "/robots.txt"
++        self.sitemap_urls = []
++        self.max_depth = 2
++        self.failed = []
++
++
++def page(url="https://example.in/", **kw):
++    p = k.Page(url=url)
++    p.status = kw.pop("status", 200)
++    p.elapsed_ms = kw.pop("elapsed_ms", 100)
++    p.bytes = kw.pop("bytes", 20000)
++    p.title = kw.pop("title", "A perfectly ordinary page title here")
++    p.meta_description = kw.pop("meta_description", "d" * 120)
++    p.h1 = kw.pop("h1", ["One"])
++    p.h2 = kw.pop("h2", ["Two"])
++    p.words = kw.pop("words", 500)
++    p.https = kw.pop("https", True)
++    p.lang = kw.pop("lang", "en-IN")
++    p.viewport = kw.pop("viewport", "width=device-width")
++    p.canonical = kw.pop("canonical", url)
++    p.internal_links = kw.pop("internal_links", 8)
++    p.headers = kw.pop("headers", {"content-encoding": "gzip", "cache-control": "max-age=60"})
++    for key, value in kw.items():
++        setattr(p, key, value)
++    return p
++
++
++class TestRefusesToScoreNothing(unittest.TestCase):
++    def test_empty_crawl_raises_instead_of_scoring(self):
++        a = k.Analyzer(FakeCrawler([]))
++        with self.assertRaises(k.AuditError):
++            a.run()
++
++    def test_only_failed_pages_raises(self):
++        pages = [page(status=502, error="HTTP 502"), page(url="https://example.in/b", status=0,
++                                                          error="connection refused")]
++        with self.assertRaises(k.AuditError):
++            k.Analyzer(FakeCrawler(pages)).run()
++
++    def test_all_pages_rendered_in_the_browser_raises(self):
++        pages = [page(words=3, js_only=True, script_count=4),
++                 page(url="https://example.in/b", words=2, js_only=True, script_count=3)]
++        with self.assertRaises(k.AuditError):
++            k.Analyzer(FakeCrawler(pages)).run()
++
++
++class TestUnmeasuredChecksDoNotScore(unittest.TestCase):
++    def test_skip_is_excluded_from_the_average(self):
++        """A check nobody could run must not lift the score."""
++        a = k.Analyzer(FakeCrawler([page()]))
++        a.add("x", "Technical", "passes", "high", "pass", "", "", [], 1.0)
++        a.add("y", "Technical", "fails", "high", "fail", "", "", [], 1.0)
++        before = a.scores()["Technical"]
++        a.add("z", "Technical", "never measured", "high", "skip", "", "", [], 1.0)
++        after = a.scores()["Technical"]
++        self.assertEqual(before, 50.0)
++        self.assertEqual(after, 50.0)
++
++    def test_category_with_no_measured_check_is_dropped_and_weights_renormalised(self):
++        a = k.Analyzer(FakeCrawler([page()]))
++        a.add("t", "Technical", "t", "high", "pass", "", "", [], 1.0)
++        a.add("p", "Performance", "p", "high", "skip", "", "", [], 1.0)
++        s = a.scores()
++        self.assertEqual(s["Technical"], 100.0)
++        self.assertIsNone(s["Performance"])
++        self.assertEqual(s["Overall"], 100.0)  # not dragged toward 0 by the empty category
++
++    def test_coverage_is_reported(self):
++        a = k.Analyzer(FakeCrawler([page()]))
++        a.add("t", "Technical", "t", "high", "pass", "", "", [], 1.0)
++        a.add("o", "On-page", "o", "high", "skip", "", "", [], 1.0)
++        a.scores()
++        self.assertAlmostEqual(a.coverage, 0.30 / 0.55, places=3)
++
++    def test_no_measured_check_at_all_gives_no_score(self):
++        a = k.Analyzer(FakeCrawler([page()]))
++        a.add("t", "Technical", "t", "high", "skip", "", "", [], 1.0)
++        self.assertIsNone(a.scores()["Overall"])
++
++
++class TestPageLevelChecksCannotPassOnAnEmptySet(unittest.TestCase):
++    def test_onpage_checks_are_not_measured_when_content_pages_is_empty(self):
++        a = k.Analyzer(FakeCrawler([page(words=2, js_only=True, script_count=5)]))
++        a.check_titles()
++        self.assertEqual(a.checks[0].status, "skip")
++        self.assertIn("Not measured", a.checks[0].detail)
++
++    def test_https_is_not_measured_on_a_local_mirror(self):
++        a = k.Analyzer(FakeCrawler([page(url="http://127.0.0.1:8801/", https=False)],
++                                   start="http://127.0.0.1:8801/"))
++        a.check_https()
++        self.assertEqual(a.checks[0].status, "skip")
++
++    def test_https_still_fails_for_a_real_plain_http_site(self):
++        a = k.Analyzer(FakeCrawler([page(url="http://example.in/", https=False)],
++                                   start="http://example.in/"))
++        a.check_https()
++        self.assertEqual(a.checks[0].status, "fail")
++
++
++class TestPageRowsKeepTheBadPages(unittest.TestCase):
++    def test_failed_and_js_pages_appear_without_a_score(self):
++        pages = [page(), page(url="https://example.in/gone", status=404, error="HTTP 404"),
++                 page(url="https://example.in/app", words=2, js_only=True, script_count=3)]
++        rows = k.Analyzer(FakeCrawler(pages)).page_rows()
++        self.assertEqual(len(rows), 3)
++        by_flag = {r["flag"]: r for r in rows}
++        self.assertIsNotNone(by_flag[""]["score"])
++        self.assertIsNone(by_flag["failed"]["score"])
++        self.assertIsNone(by_flag["js"]["score"])
++
++
++class TestRedaction(unittest.TestCase):
++    def test_credentials_and_secret_query_values_are_stripped(self):
++        out = k.redact_url("https://bob:hunter2@example.in/private?token=abc&page=2&api_key=Z")
++        self.assertNotIn("hunter2", out)
++        self.assertNotIn("abc", out)
++        self.assertNotIn("Z", out)
++        self.assertIn("page=2", out)
++
++    def test_session_parameters_are_redacted(self):
++        self.assertIn("[redacted]", k.redact_url("https://x.in/l?sessionid=deadbeef"))
++        self.assertIn("[redacted]", k.redact_url("https://x.in/d?signature=9f8e"))
++
++    def test_affected_lists_are_redacted_at_the_source(self):
++        a = k.Analyzer(FakeCrawler([page()]))
++        a.add("x", "Technical", "t", "high", "fail", "", "",
++              ["https://x.in/a?token=supersecret"], 1.0)
++        self.assertNotIn("supersecret", " ".join(a.checks[0].affected))
++
++    def test_page_rows_are_redacted(self):
++        rows = k.Analyzer(FakeCrawler([page(url="https://x.in/a?key=secret123")])).page_rows()
++        self.assertNotIn("secret123", rows[0]["url"])
++
++
++class TestPrivateOrigin(unittest.TestCase):
++    def test_private_and_public(self):
++        for url in ("http://localhost:8000/", "http://127.0.0.1:8801/",
++                    "http://192.168.1.5/", "http://10.0.0.2/", "http://box.local/"):
++            self.assertTrue(k.is_private_origin(url), url)
++        for url in ("https://kovik.online/", "https://8.8.8.8/"):
++            self.assertFalse(k.is_private_origin(url), url)
++
++
++class TestReportSurvivesAnUnscoredAudit(unittest.TestCase):
++    def test_disp_never_rewrites_the_host(self):
++        a = k.Analyzer(FakeCrawler([page(url="http://127.0.0.1:8801/x.html")],
++                                   start="http://127.0.0.1:8801/"))
++        r = k.AuditReport(a, a.base, display_site="https://kovik.online")
++        self.assertEqual(r.disp("http://127.0.0.1:8801/x.html"), "http://127.0.0.1:8801/x.html")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.39.5
+
